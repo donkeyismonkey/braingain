@@ -1,0 +1,13 @@
+{
+  "name": "braingain-server",
+  "version": "1.0.0",
+  "description": "BrainGain login and classes server",
+  "main": "Server.js",
+  "scripts": {
+    "start": "node Server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {}
+}
