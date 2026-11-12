@@ -10,8 +10,6 @@ const ORIGINS = String(process.env.ALLOWED_ORIGINS || "")
   .map((s) => s.trim().replace(/\/+$/, ""))
   .filter(Boolean);
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
-const APPLE_CLIENT_ID = process.env.APPLE_CLIENT_ID || "";
-const APPLE_REDIRECT_URI = process.env.APPLE_REDIRECT_URI || "";
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const MAIL_FROM = process.env.MAIL_FROM || "BrainGain <onboarding@resend.dev>";
 const ALLOW_DEMO = process.env.ALLOW_DEMO_LOGIN === "1";
@@ -21,8 +19,6 @@ const DB_FILE = path.join(DATA_DIR, "braingain.json");
 
 const GOOGLE_JWKS = "https://www.googleapis.com/oauth2/v3/certs";
 const GOOGLE_ISSUERS = ["https://accounts.google.com", "accounts.google.com"];
-const APPLE_JWKS = "https://appleid.apple.com/auth/keys";
-const APPLE_ISSUERS = ["https://appleid.apple.com"];
 
 const SESSION_MS = 7 * 24 * 3600 * 1000;
 const CODE_TTL = 10 * 60 * 1000;
@@ -31,7 +27,7 @@ const MAX_TRIES = 5;
 const CLASS_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 const RESERVED = new Set(["admin", "administrator", "root", "support", "braingain", "teacher", "educator", "student", "moderator", "system", "help"]);
 
-let db = { users: {}, byProvider: {}, usernames: {}, classes: {}, byCode: {} };
+let db = { users: {}, byProvider: {}, usernames: {}, classes: {}, byCode: {}, reviews: {}, scores: {} };
 let saveTimer = 0;
 
 function loadDb() {
@@ -114,6 +110,7 @@ function limited(key, max, windowMs) {
 
 setInterval(() => {
   const now = Date.now();
+  for (const [k, e] of emailLogins) if (now > e.exp) emailLogins.delete(k);
   for (const [k, b] of buckets) if (!b.length || now - b[b.length - 1] > 3600000) buckets.delete(k);
 }, 60000).unref();
 
@@ -139,6 +136,21 @@ function cleanName(raw, max) {
     .trim()
     .slice(0, max);
 }
+
+function cleanText(raw, max) {
+  return String(raw || "")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, max);
+}
+
+const normAnswer = (s) =>
+  String(s || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s.\-]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
 
 function shortName(full) {
   const t = cleanName(full, 60).split(" ").filter(Boolean);
@@ -207,15 +219,25 @@ async function verifyIdToken(token, opts) {
   return payload;
 }
 
+function prettyName(email) {
+  const words = String(email).split("@")[0].replace(/[._+\-]+/g, " ").replace(/[0-9]+$/, "").trim().split(" ").filter(Boolean);
+  const out = words.map((w) => w[0].toUpperCase() + w.slice(1)).join(" ").slice(0, 30);
+  return out || "Student";
+}
+
 function signIn(provider, sub, name, email) {
   const key = provider + ":" + sub;
   let u = db.users[db.byProvider[key]];
+  if (!u && email && provider !== "demo") {
+    u = Object.values(db.users).find((x) => x.provider !== "demo" && x.email === email);
+    if (u) db.byProvider[key] = u.id;
+  }
   if (!u) {
     u = { id: rand(12), provider: provider, sub: sub, name: name || "Student", email: email || "", role: null, tv: 0, created: Date.now(), educator: null, pending: null };
     db.users[u.id] = u;
     db.byProvider[key] = u.id;
   } else {
-    if (name) u.name = name;
+    if (name && provider !== "email") u.name = name;
     if (email) u.email = email;
   }
   saveDb();
@@ -236,21 +258,6 @@ async function authGoogle(c) {
   return signIn("google", p.sub, name, email);
 }
 
-async function authApple(c) {
-  if (!APPLE_CLIENT_ID) fail(503, "Apple sign-in isn't set up on the server yet.");
-  let p;
-  try {
-    p = await verifyIdToken(String(c.body.id_token || ""), { jwks: APPLE_JWKS, issuers: APPLE_ISSUERS, audience: APPLE_CLIENT_ID });
-  } catch (e) {
-    fail(401, "Apple sign-in couldn't be verified. Please try again.");
-  }
-  const verified = p.email_verified === true || p.email_verified === "true";
-  const email = verified ? String(p.email || "").toLowerCase().slice(0, 120) : "";
-  const nm = c.body.user && typeof c.body.user === "object" && c.body.user.name && typeof c.body.user.name === "object" ? c.body.user.name : null;
-  const name = nm ? cleanName([nm.firstName, nm.lastName].filter(Boolean).join(" "), 60) : "";
-  return signIn("apple", p.sub, name, email);
-}
-
 function authDemo(c) {
   if (!ALLOW_DEMO) fail(403, "Demo sign-in is turned off.");
   const name = cleanName(c.body.name, 40) || "Demo User";
@@ -269,10 +276,20 @@ function setRole(c) {
   return { user: publicUser(u) };
 }
 
-async function sendMail(to, code) {
+const emailLogins = new Map();
+
+function normEmail(raw) {
+  const e = String(raw || "").trim().toLowerCase();
+  return e.length > 120 || !/^[^\s@]{1,64}@[^\s@]{1,200}\.[^\s@]{2,}$/.test(e) ? "" : e;
+}
+
+async function sendMail(to, code, purpose) {
+  const signin = purpose === "signin";
+  const subject = signin ? "Your BrainGain sign-in code" : "Your BrainGain verification code";
+  const intro = signin ? "Use this code to sign in to BrainGain:" : "Use this code to finish creating your educator account:";
   if (!RESEND_API_KEY) {
     if (DEV_SHOW_CODE) {
-      console.log("[mail] testing mode: code " + code + " for " + to);
+      console.log("[mail] testing mode: " + subject + " " + code + " for " + to);
       return;
     }
     throw new Error("mail-off");
@@ -280,7 +297,7 @@ async function sendMail(to, code) {
   const html =
     '<div style="font-family:Arial,sans-serif;max-width:420px;margin:auto;padding:24px;border:3px solid #1d2b53;border-radius:16px">' +
     '<h2 style="margin:0 0 8px;color:#1d2b53">BrainGain</h2>' +
-    "<p>Use this code to finish creating your educator account:</p>" +
+    "<p>" + intro + "</p>" +
     '<p style="font-size:36px;letter-spacing:8px;font-weight:bold;margin:16px 0;color:#1d2b53">' +
     code +
     "</p>" +
@@ -288,9 +305,54 @@ async function sendMail(to, code) {
   const r = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: { Authorization: "Bearer " + RESEND_API_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({ from: MAIL_FROM, to: [to], subject: "Your BrainGain verification code", text: "Your BrainGain verification code is " + code + ". It works for 10 minutes.", html: html })
+    body: JSON.stringify({ from: MAIL_FROM, to: [to], subject: subject, text: subject + " is " + code + ". It works for 10 minutes.", html: html })
   });
   if (!r.ok) throw new Error("mail-failed");
+}
+
+async function emailStart(c) {
+  if (!RESEND_API_KEY && !DEV_SHOW_CODE) fail(503, "Email sign-in isn't set up on the server yet.");
+  const email = normEmail(c.body.email);
+  if (!email) fail(400, "Enter a real email address.");
+  const now = Date.now();
+  const prev = emailLogins.get(email);
+  if (prev && now - prev.sentAt < RESEND_GAP) fail(429, "Wait a few seconds before asking for another code.");
+  if (limited("emailsend:" + c.ip, 10, 3600000)) fail(429, "Too many codes asked for. Try again in an hour.");
+  if (limited("emailaddr:" + email, 5, 3600000)) fail(429, "That's a lot of codes for one email. Try again in an hour.");
+  const code = String(crypto.randomInt(100000, 1000000));
+  const entry = { hash: hashCode("login:" + email, code), exp: now + CODE_TTL, tries: 0, sentAt: now, name: cleanName(c.body.name, 40) };
+  try {
+    await sendMail(email, code, "signin");
+  } catch (e) {
+    if (e.message === "mail-off") fail(503, "Email sign-in isn't set up on the server yet.");
+    fail(502, "The email couldn't be sent. Please try again.");
+  }
+  emailLogins.set(email, entry);
+  const out = { ok: true, sentTo: maskEmail(email) };
+  if (DEV_SHOW_CODE) out.devCode = code;
+  return out;
+}
+
+function emailVerify(c) {
+  const email = normEmail(c.body.email);
+  const entry = email ? emailLogins.get(email) : null;
+  if (!entry) fail(400, "Ask for a sign-in code first.");
+  if (Date.now() > entry.exp) {
+    emailLogins.delete(email);
+    fail(410, "That code expired. Ask for a new one.");
+  }
+  const code = String(c.body.code || "").replace(/\s/g, "");
+  if (!/^[0-9]{6}$/.test(code)) fail(400, "The code is 6 numbers.");
+  entry.tries++;
+  if (!sameText(hashCode("login:" + email, code), entry.hash)) {
+    if (entry.tries >= MAX_TRIES) {
+      emailLogins.delete(email);
+      fail(429, "Too many wrong codes. Please ask for a new one.");
+    }
+    fail(400, "That code isn't right. " + (MAX_TRIES - entry.tries) + " tries left.");
+  }
+  emailLogins.delete(email);
+  return signIn("email", email, entry.name || prettyName(email), email);
 }
 
 async function issueCode(u, info) {
@@ -372,6 +434,181 @@ function educatorVerify(c) {
   return { user: publicUser(u) };
 }
 
+function cleanQuestions(raw) {
+  if (!Array.isArray(raw) || raw.length < 1) fail(400, "Add at least one question.");
+  if (raw.length > 50) fail(400, "A review can have up to 50 questions.");
+  return raw.map((q, i) => {
+    const n = i + 1;
+    if (!q || typeof q !== "object") fail(400, "Question " + n + " couldn't be read.");
+    const text = cleanText(q.q, 200);
+    if (text.length < 2) fail(400, "Question " + n + " needs some text.");
+    if (q.t === "mc") {
+      const options = Array.isArray(q.options) ? q.options.map((o) => cleanText(o, 100)) : [];
+      if (options.length < 2 || options.length > 6) fail(400, "Question " + n + " needs 2 to 6 answer choices.");
+      if (options.some((o) => !o)) fail(400, "Fill in every answer choice for question " + n + ".");
+      const a = Number(q.a);
+      if (!Number.isInteger(a) || a < 0 || a >= options.length) fail(400, "Pick the right answer for question " + n + ".");
+      return { t: "mc", q: text, options: options, a: a };
+    }
+    if (q.t === "short") {
+      const a = cleanText(q.a, 100);
+      if (!normAnswer(a.split("|")[0])) fail(400, "Type the right answer for question " + n + ".");
+      return { t: "short", q: text, a: a };
+    }
+    fail(400, "Question " + n + " has an unknown type.");
+  });
+}
+
+function requireCreator(u) {
+  if (u.role === "student" || (u.role === "educator" && u.educator)) return;
+  fail(403, "Finish setting up your account first.");
+}
+
+function reviewBody(c) {
+  const title = cleanText(c.body.title, 60);
+  if (title.length < 2) fail(400, "Give the review a title.");
+  return { title: title, subject: cleanText(c.body.subject, 40), questions: cleanQuestions(c.body.questions) };
+}
+
+const reviewMeta = (r) => ({ id: r.id, title: r.title, subject: r.subject, count: r.questions.length, updated: r.updated });
+
+function ownReviewById(u, id) {
+  const r = db.reviews[String(id || "")];
+  if (!r || r.ownerId !== u.id) fail(404, "Review not found.");
+  return r;
+}
+
+function dropScores(reviewId) {
+  for (const k of Object.keys(db.scores)) if (k.indexOf(reviewId + ":") === 0) delete db.scores[k];
+}
+
+function createReview(c) {
+  requireCreator(c.user);
+  if (Object.values(db.reviews).filter((r) => r.ownerId === c.user.id).length >= 50) fail(400, "That's the most reviews you can keep (50).");
+  const b = reviewBody(c);
+  const r = { id: rand(8), ownerId: c.user.id, title: b.title, subject: b.subject, questions: b.questions, classIds: [], created: Date.now(), updated: Date.now() };
+  db.reviews[r.id] = r;
+  saveDb();
+  return { review: reviewMeta(r) };
+}
+
+function getReview(c) {
+  const r = ownReviewById(c.user, c.body.id);
+  return { review: { id: r.id, title: r.title, subject: r.subject, questions: r.questions } };
+}
+
+function updateReview(c) {
+  const r = ownReviewById(c.user, c.body.id);
+  Object.assign(r, reviewBody(c), { updated: Date.now() });
+  dropScores(r.id);
+  saveDb();
+  return { review: reviewMeta(r) };
+}
+
+function deleteReview(c) {
+  const r = ownReviewById(c.user, c.body.id);
+  delete db.reviews[r.id];
+  dropScores(r.id);
+  saveDb();
+  return { ok: true };
+}
+
+function inClass(u, classId) {
+  const k = db.classes[classId];
+  return !!k && k.students.indexOf(u.id) !== -1;
+}
+
+function reachable(u, r) {
+  return r.ownerId === u.id || (u.role === "student" && r.classIds.some((cid) => inClass(u, cid)));
+}
+
+function listReviews(c) {
+  const u = c.user;
+  requireCreator(u);
+  const mine = Object.values(db.reviews)
+    .filter((r) => r.ownerId === u.id)
+    .sort((a, b) => b.updated - a.updated)
+    .map((r) => {
+      const sc = db.scores[r.id + ":" + u.id];
+      const m = Object.assign(reviewMeta(r), { best: sc ? sc.best : null });
+      if (u.role === "educator") m.classIds = r.classIds.slice();
+      return m;
+    });
+  const assigned = [];
+  if (u.role === "student") {
+    for (const r of Object.values(db.reviews)) {
+      const cid = r.ownerId !== u.id ? r.classIds.find((id) => inClass(u, id)) : null;
+      if (!cid) continue;
+      const sc = db.scores[r.id + ":" + u.id];
+      assigned.push(Object.assign(reviewMeta(r), { className: db.classes[cid].name, educator: educatorLabel(db.users[r.ownerId] || {}), best: sc ? sc.best : null }));
+    }
+  }
+  return { mine: mine, assigned: assigned };
+}
+
+function takeReview(c) {
+  const r = db.reviews[String(c.body.id || "")];
+  if (!r || !reachable(c.user, r)) fail(404, "Review not found.");
+  return { review: { id: r.id, title: r.title, subject: r.subject, questions: r.questions.map((q) => (q.t === "mc" ? { t: "mc", q: q.q, options: q.options } : { t: "short", q: q.q })) } };
+}
+
+function submitReview(c) {
+  const r = db.reviews[String(c.body.id || "")];
+  if (!r || !reachable(c.user, r)) fail(404, "Review not found.");
+  const answers = Array.isArray(c.body.answers) ? c.body.answers : [];
+  let score = 0;
+  const results = r.questions.map((q, i) => {
+    const given = answers[i];
+    let ok = false;
+    if (q.t === "mc") ok = Number.isInteger(given) && given === q.a;
+    else ok = typeof given === "string" && q.a.split("|").map(normAnswer).filter(Boolean).indexOf(normAnswer(given.slice(0, 200))) !== -1;
+    if (ok) score++;
+    return {
+      correct: ok,
+      yours: q.t === "mc" ? (Number.isInteger(given) ? given : null) : typeof given === "string" ? cleanText(given, 100) : "",
+      answer: q.t === "mc" ? q.a : q.a.split("|")[0].trim()
+    };
+  });
+  const key = r.id + ":" + c.user.id;
+  const sc = db.scores[key] || { best: 0, count: 0 };
+  sc.count = Math.min(sc.count + 1, 999);
+  sc.best = Math.max(sc.best, score);
+  sc.total = r.questions.length;
+  sc.at = Date.now();
+  db.scores[key] = sc;
+  saveDb();
+  return { score: score, total: r.questions.length, results: results };
+}
+
+function assignReview(c) {
+  if (c.user.role !== "educator") fail(403, "Only educators can give reviews to classes.");
+  const r = ownReviewById(c.user, c.body.reviewId);
+  const k = db.classes[String(c.body.classId || "")];
+  if (!k || k.ownerId !== c.user.id) fail(404, "Class not found.");
+  const has = r.classIds.indexOf(k.id) !== -1;
+  if (c.body.on === true && !has) r.classIds.push(k.id);
+  else if (c.body.on === false && has) r.classIds = r.classIds.filter((id) => id !== k.id);
+  saveDb();
+  return { classIds: r.classIds.slice() };
+}
+
+function reviewResults(c) {
+  const r = ownReviewById(c.user, c.body.id);
+  const classes = r.classIds
+    .map((cid) => db.classes[cid])
+    .filter(Boolean)
+    .map((k) => ({
+      id: k.id,
+      name: k.name,
+      students: k.students.map((sid) => {
+        const s = db.users[sid];
+        const sc = db.scores[r.id + ":" + sid];
+        return { name: shortName(s ? s.name : ""), best: sc ? sc.best : null, total: r.questions.length, attempts: sc ? sc.count : 0 };
+      })
+    }));
+  return { title: r.title, classes: classes };
+}
+
 function listClasses(c) {
   const u = c.user;
   const all = Object.values(db.classes);
@@ -380,7 +617,13 @@ function listClasses(c) {
     return {
       classes: all
         .filter((k) => k.ownerId === u.id)
-        .map((k) => ({ id: k.id, code: k.code, name: k.name, students: k.students.map((id) => db.users[id]).filter(Boolean).map((s) => ({ name: shortName(s.name) })) }))
+        .map((k) => ({
+          id: k.id,
+          code: k.code,
+          name: k.name,
+          students: k.students.map((id) => db.users[id]).filter(Boolean).map((s) => ({ name: shortName(s.name) })),
+          reviews: Object.values(db.reviews).filter((r) => r.classIds.indexOf(k.id) !== -1).map((r) => ({ id: r.id, title: r.title }))
+        }))
     };
   }
   if (u.role === "student") {
@@ -435,6 +678,7 @@ function deleteClass(c) {
   if (!k || k.ownerId !== c.user.id) fail(404, "Class not found.");
   delete db.classes[k.id];
   delete db.byCode[k.code];
+  for (const r of Object.values(db.reviews)) r.classIds = r.classIds.filter((id) => id !== k.id);
   saveDb();
   return { ok: true };
 }
@@ -446,9 +690,10 @@ function logout(c) {
 }
 
 const ROUTES = {
-  "GET /config": { fn: () => ({ google: GOOGLE_CLIENT_ID ? { clientId: GOOGLE_CLIENT_ID } : null, apple: APPLE_CLIENT_ID && APPLE_REDIRECT_URI ? { clientId: APPLE_CLIENT_ID, redirectURI: APPLE_REDIRECT_URI } : null, demo: ALLOW_DEMO }) },
+  "GET /config": { fn: () => ({ google: GOOGLE_CLIENT_ID ? { clientId: GOOGLE_CLIENT_ID } : null, email: !!(RESEND_API_KEY || DEV_SHOW_CODE), demo: ALLOW_DEMO }) },
   "POST /auth/google": { limit: 30, fn: authGoogle },
-  "POST /auth/apple": { limit: 30, fn: authApple },
+  "POST /auth/email/start": { limit: 30, fn: emailStart },
+  "POST /auth/email/verify": { limit: 30, fn: emailVerify },
   "POST /auth/demo": { limit: 30, fn: authDemo },
   "GET /me": { auth: true, fn: (c) => ({ user: publicUser(c.user) }) },
   "POST /role": { auth: true, fn: setRole },
@@ -460,6 +705,15 @@ const ROUTES = {
   "POST /classes/join": { auth: true, fn: joinClass },
   "POST /classes/leave": { auth: true, fn: leaveClass },
   "POST /classes/delete": { auth: true, fn: deleteClass },
+  "GET /reviews": { auth: true, fn: listReviews },
+  "POST /reviews": { auth: true, max: 60000, fn: createReview },
+  "POST /reviews/get": { auth: true, fn: getReview },
+  "POST /reviews/update": { auth: true, max: 60000, fn: updateReview },
+  "POST /reviews/delete": { auth: true, fn: deleteReview },
+  "POST /reviews/take": { auth: true, fn: takeReview },
+  "POST /reviews/submit": { auth: true, fn: submitReview },
+  "POST /reviews/assign": { auth: true, fn: assignReview },
+  "POST /reviews/results": { auth: true, fn: reviewResults },
   "POST /logout": { auth: true, fn: logout }
 };
 
@@ -545,7 +799,7 @@ const server = http.createServer(async (req, res) => {
     const user = route.auth ? userFromRequest(req) : null;
     if (route.auth && !user) fail(401, "Please sign in again.");
     if (route.auth && limited("api:" + user.id, 240, 60000)) fail(429, "Slow down a little.");
-    const body = await readJson(req, 10000);
+    const body = await readJson(req, route.max || 10000);
     const out = await route.fn({ req: req, ip: ip, body: body, user: user });
     reply(200, out);
   } catch (e) {
@@ -570,7 +824,7 @@ loadDb();
 if (require.main === module) {
   if (!ORIGINS.length) console.log("[security] ALLOWED_ORIGINS is not set, so any website can call this server");
   if (!process.env.AUTH_SECRET) console.log("[security] AUTH_SECRET is not set. Logins will reset every time the server restarts");
-  console.log("[login] Google: " + (GOOGLE_CLIENT_ID ? "on" : "off") + ", Apple: " + (APPLE_CLIENT_ID && APPLE_REDIRECT_URI ? "on" : "off") + ", demo: " + (ALLOW_DEMO ? "ON (testing only)" : "off"));
+  console.log("[login] Google: " + (GOOGLE_CLIENT_ID ? "on" : "off") + ", email: " + (RESEND_API_KEY || DEV_SHOW_CODE ? "on" : "off") + ", demo: " + (ALLOW_DEMO ? "ON (testing only)" : "off"));
   console.log("[mail] " + (RESEND_API_KEY ? "Resend is set up" : DEV_SHOW_CODE ? "testing mode: codes are shown on screen" : "NOT set up: educators can't verify yet"));
   server.listen(PORT, () => console.log("BrainGain server listening on port " + PORT));
 }
