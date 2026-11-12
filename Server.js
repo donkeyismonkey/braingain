@@ -27,7 +27,7 @@ const MAX_TRIES = 5;
 const CLASS_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 const RESERVED = new Set(["admin", "administrator", "root", "support", "braingain", "teacher", "educator", "student", "moderator", "system", "help"]);
 
-let db = { users: {}, byProvider: {}, usernames: {}, classes: {}, byCode: {}, reviews: {}, scores: {} };
+let db = { users: {}, byProvider: {}, usernames: {}, classes: {}, byCode: {}, reviews: {}, scores: {}, subs: {} };
 let saveTimer = 0;
 
 function loadDb() {
@@ -434,7 +434,12 @@ function educatorVerify(c) {
   return { user: publicUser(u) };
 }
 
-function cleanQuestions(raw) {
+const DAY = 86400000;
+const live = new Map();
+const sessions = new Map();
+const kindOf = (r) => r.kind || "review";
+
+function cleanQuestions(raw, kind) {
   if (!Array.isArray(raw) || raw.length < 1) fail(400, "Add at least one question.");
   if (raw.length > 50) fail(400, "A review can have up to 50 questions.");
   return raw.map((q, i) => {
@@ -442,20 +447,23 @@ function cleanQuestions(raw) {
     if (!q || typeof q !== "object") fail(400, "Question " + n + " couldn't be read.");
     const text = cleanText(q.q, 200);
     if (text.length < 2) fail(400, "Question " + n + " needs some text.");
+    let item;
     if (q.t === "mc") {
       const options = Array.isArray(q.options) ? q.options.map((o) => cleanText(o, 100)) : [];
       if (options.length < 2 || options.length > 6) fail(400, "Question " + n + " needs 2 to 6 answer choices.");
       if (options.some((o) => !o)) fail(400, "Fill in every answer choice for question " + n + ".");
       const a = Number(q.a);
       if (!Number.isInteger(a) || a < 0 || a >= options.length) fail(400, "Pick the right answer for question " + n + ".");
-      return { t: "mc", q: text, options: options, a: a };
-    }
-    if (q.t === "short") {
+      item = { t: "mc", q: text, options: options, a: a };
+    } else if (q.t === "short") {
       const a = cleanText(q.a, 100);
       if (!normAnswer(a.split("|")[0])) fail(400, "Type the right answer for question " + n + ".");
-      return { t: "short", q: text, a: a };
+      item = { t: "short", q: text, a: a };
+    } else {
+      fail(400, "Question " + n + " has an unknown type.");
     }
-    fail(400, "Question " + n + " has an unknown type.");
+    if (kind === "quiz") item.sec = Math.max(5, Math.min(120, Math.round(Number(q.sec)) || 20));
+    return item;
   });
 }
 
@@ -464,29 +472,48 @@ function requireCreator(u) {
   fail(403, "Finish setting up your account first.");
 }
 
-function reviewBody(c) {
-  const title = cleanText(c.body.title, 60);
-  if (title.length < 2) fail(400, "Give the review a title.");
-  return { title: title, subject: cleanText(c.body.subject, 40), questions: cleanQuestions(c.body.questions) };
+function requireEducator(u) {
+  if (u.role !== "educator" || !u.educator) fail(403, "Only educators can do that.");
 }
 
-const reviewMeta = (r) => ({ id: r.id, title: r.title, subject: r.subject, count: r.questions.length, updated: r.updated });
+function reviewBody(c, forcedKind) {
+  const kind = forcedKind || (c.body.kind === "assignment" || c.body.kind === "quiz" ? c.body.kind : "review");
+  const title = cleanText(c.body.title, 60);
+  if (title.length < 2) fail(400, "Give it a title.");
+  const out = { kind: kind, title: title, subject: cleanText(c.body.subject, 40), questions: cleanQuestions(c.body.questions, kind) };
+  if (kind === "assignment") {
+    const due = Number(c.body.due);
+    if (!Number.isFinite(due) || due < Date.now() - 60 * DAY || due > Date.now() + 400 * DAY) fail(400, "Pick a due date.");
+    out.due = Math.round(due);
+  }
+  return out;
+}
+
+const reviewMeta = (r) => ({ id: r.id, title: r.title, subject: r.subject, count: r.questions.length, updated: r.updated, kind: kindOf(r), due: r.due || null, published: !!r.published, remixes: r.remixes || 0 });
 
 function ownReviewById(u, id) {
   const r = db.reviews[String(id || "")];
-  if (!r || r.ownerId !== u.id) fail(404, "Review not found.");
+  if (!r || r.ownerId !== u.id) fail(404, "Not found.");
   return r;
 }
 
 function dropScores(reviewId) {
   for (const k of Object.keys(db.scores)) if (k.indexOf(reviewId + ":") === 0) delete db.scores[k];
+  for (const k of Object.keys(db.subs)) if (k.indexOf(reviewId + ":") === 0) delete db.subs[k];
+  for (const k of [...live.keys()]) if (k.indexOf(reviewId + ":") === 0) live.delete(k);
+}
+
+function hasSubmissions(r) {
+  return Object.keys(db.subs).some((k) => k.indexOf(r.id + ":") === 0);
 }
 
 function createReview(c) {
   requireCreator(c.user);
-  if (Object.values(db.reviews).filter((r) => r.ownerId === c.user.id).length >= 50) fail(400, "That's the most reviews you can keep (50).");
   const b = reviewBody(c);
-  const r = { id: rand(8), ownerId: c.user.id, title: b.title, subject: b.subject, questions: b.questions, classIds: [], created: Date.now(), updated: Date.now() };
+  if (b.kind !== "review") requireEducator(c.user);
+  if (b.kind === "assignment" && b.due < Date.now()) fail(400, "The due date has to be in the future.");
+  if (Object.values(db.reviews).filter((r) => r.ownerId === c.user.id).length >= 50) fail(400, "That's the most you can keep (50).");
+  const r = Object.assign({ id: rand(8), ownerId: c.user.id, classIds: [], published: false, remixes: 0, created: Date.now(), updated: Date.now() }, b);
   db.reviews[r.id] = r;
   saveDb();
   return { review: reviewMeta(r) };
@@ -494,12 +521,13 @@ function createReview(c) {
 
 function getReview(c) {
   const r = ownReviewById(c.user, c.body.id);
-  return { review: { id: r.id, title: r.title, subject: r.subject, questions: r.questions } };
+  return { review: { id: r.id, title: r.title, subject: r.subject, kind: kindOf(r), due: r.due || null, locked: kindOf(r) === "assignment" && hasSubmissions(r), questions: r.questions } };
 }
 
 function updateReview(c) {
   const r = ownReviewById(c.user, c.body.id);
-  Object.assign(r, reviewBody(c), { updated: Date.now() });
+  if (kindOf(r) === "assignment" && hasSubmissions(r)) fail(409, "Students already turned this in, so it can't be changed.");
+  Object.assign(r, reviewBody(c, kindOf(r)), { updated: Date.now() });
   dropScores(r.id);
   saveDb();
   return { review: reviewMeta(r) };
@@ -519,8 +547,17 @@ function inClass(u, classId) {
 }
 
 function reachable(u, r) {
-  return r.ownerId === u.id || (u.role === "student" && r.classIds.some((cid) => inClass(u, cid)));
+  return r.ownerId === u.id || (u.role === "student" && kindOf(r) !== "quiz" && r.classIds.some((cid) => inClass(u, cid)));
 }
+
+function isCorrect(q, given) {
+  if (q.t === "mc") return Number.isInteger(given) && given === q.a;
+  return typeof given === "string" && q.a.split("|").map(normAnswer).filter(Boolean).indexOf(normAnswer(given.slice(0, 200))) !== -1;
+}
+
+const answerOf = (q) => (q.t === "mc" ? q.a : q.a.split("|")[0].trim());
+const cleanAnswer = (q, given) => (q.t === "mc" ? (Number.isInteger(given) ? given : null) : typeof given === "string" ? cleanText(given, 100) : "");
+const showAnswer = (q, a) => (q.t === "mc" ? (Number.isInteger(a) && q.options[a] !== undefined ? q.options[a] : "No answer") : a || "No answer");
 
 function listReviews(c) {
   const u = c.user;
@@ -537,10 +574,14 @@ function listReviews(c) {
   const assigned = [];
   if (u.role === "student") {
     for (const r of Object.values(db.reviews)) {
-      const cid = r.ownerId !== u.id ? r.classIds.find((id) => inClass(u, id)) : null;
+      const kind = kindOf(r);
+      const cid = r.ownerId !== u.id && kind !== "quiz" ? r.classIds.find((id) => inClass(u, id)) : null;
       if (!cid) continue;
-      const sc = db.scores[r.id + ":" + u.id];
-      assigned.push(Object.assign(reviewMeta(r), { className: db.classes[cid].name, educator: educatorLabel(db.users[r.ownerId] || {}), best: sc ? sc.best : null }));
+      const key = r.id + ":" + u.id;
+      const m = Object.assign(reviewMeta(r), { className: db.classes[cid].name, educator: educatorLabel(db.users[r.ownerId] || {}) });
+      if (kind === "assignment") Object.assign(m, { submitted: !!db.subs[key], closed: Date.now() > r.due, best: null });
+      else m.best = db.scores[key] ? db.scores[key].best : null;
+      assigned.push(m);
     }
   }
   return { mine: mine, assigned: assigned };
@@ -548,41 +589,89 @@ function listReviews(c) {
 
 function takeReview(c) {
   const r = db.reviews[String(c.body.id || "")];
-  if (!r || !reachable(c.user, r)) fail(404, "Review not found.");
-  return { review: { id: r.id, title: r.title, subject: r.subject, questions: r.questions.map((q) => (q.t === "mc" ? { t: "mc", q: q.q, options: q.options } : { t: "short", q: q.q })) } };
+  if (!r || !reachable(c.user, r)) fail(404, "Not found.");
+  const kind = kindOf(r);
+  if (kind === "quiz") fail(400, "Quizzes are played live with your class.");
+  if (kind === "assignment" && r.ownerId !== c.user.id) {
+    if (Date.now() > r.due) fail(410, "This assignment is past due.");
+    if (db.subs[r.id + ":" + c.user.id]) fail(409, "You already turned this in.");
+  }
+  return { review: { id: r.id, title: r.title, subject: r.subject, kind: kind, due: r.due || null, questions: r.questions.map((q) => (q.t === "mc" ? { t: "mc", q: q.q, options: q.options } : { t: "short", q: q.q })) } };
+}
+
+function track(u, r, index, given, ok) {
+  const key = r.id + ":" + u.id;
+  const e = live.get(key) || { userId: u.id, reviewId: r.id, items: {}, at: 0 };
+  const q = r.questions[index];
+  e.items[index] = { yours: showAnswer(q, cleanAnswer(q, given)), correct: ok };
+  e.at = Date.now();
+  live.set(key, e);
+}
+
+function reachOrFail(c) {
+  const r = db.reviews[String(c.body.id || "")];
+  if (!r || !reachable(c.user, r)) fail(404, "Not found.");
+  const i = Number(c.body.index);
+  if (!Number.isInteger(i) || i < 0 || i >= r.questions.length) fail(400, "That question doesn't exist.");
+  return { r: r, i: i };
+}
+
+function checkReview(c) {
+  const { r, i } = reachOrFail(c);
+  if (kindOf(r) !== "review") fail(403, "No peeking! The answers for this are in your educator's gradebook.");
+  const q = r.questions[i];
+  const ok = isCorrect(q, c.body.answer);
+  track(c.user, r, i, c.body.answer, ok);
+  return { correct: ok, answer: answerOf(q) };
+}
+
+function progressReview(c) {
+  const { r, i } = reachOrFail(c);
+  if (kindOf(r) === "quiz") fail(400, "Not for quizzes.");
+  track(c.user, r, i, c.body.answer, isCorrect(r.questions[i], c.body.answer));
+  return { ok: true };
 }
 
 function submitReview(c) {
   const r = db.reviews[String(c.body.id || "")];
-  if (!r || !reachable(c.user, r)) fail(404, "Review not found.");
+  if (!r || !reachable(c.user, r)) fail(404, "Not found.");
+  const kind = kindOf(r);
+  if (kind === "quiz") fail(400, "Quizzes are played live with your class.");
+  const owner = r.ownerId === c.user.id;
+  const key = r.id + ":" + c.user.id;
+  if (kind === "assignment" && !owner) {
+    if (Date.now() > r.due) fail(410, "This assignment is past due.");
+    if (db.subs[key]) fail(409, "You already turned this in.");
+  }
   const answers = Array.isArray(c.body.answers) ? c.body.answers : [];
   let score = 0;
   const results = r.questions.map((q, i) => {
-    const given = answers[i];
-    let ok = false;
-    if (q.t === "mc") ok = Number.isInteger(given) && given === q.a;
-    else ok = typeof given === "string" && q.a.split("|").map(normAnswer).filter(Boolean).indexOf(normAnswer(given.slice(0, 200))) !== -1;
+    const ok = isCorrect(q, answers[i]);
     if (ok) score++;
-    return {
-      correct: ok,
-      yours: q.t === "mc" ? (Number.isInteger(given) ? given : null) : typeof given === "string" ? cleanText(given, 100) : "",
-      answer: q.t === "mc" ? q.a : q.a.split("|")[0].trim()
-    };
+    return { correct: ok, yours: cleanAnswer(q, answers[i]), answer: answerOf(q) };
   });
-  const key = r.id + ":" + c.user.id;
+  if (kind === "assignment") {
+    if (owner) return { score: score, total: r.questions.length, results: results };
+    db.subs[key] = { items: results.map((x) => ({ yours: x.yours, correct: x.correct })), score: score, total: r.questions.length, at: Date.now() };
+    live.delete(key);
+    saveDb();
+    return { submitted: true };
+  }
   const sc = db.scores[key] || { best: 0, count: 0 };
   sc.count = Math.min(sc.count + 1, 999);
   sc.best = Math.max(sc.best, score);
   sc.total = r.questions.length;
   sc.at = Date.now();
   db.scores[key] = sc;
+  live.delete(key);
   saveDb();
   return { score: score, total: r.questions.length, results: results };
 }
 
 function assignReview(c) {
-  if (c.user.role !== "educator") fail(403, "Only educators can give reviews to classes.");
+  requireEducator(c.user);
   const r = ownReviewById(c.user, c.body.reviewId);
+  if (kindOf(r) === "quiz") fail(400, "Quizzes are hosted live. Use Host live.");
   const k = db.classes[String(c.body.classId || "")];
   if (!k || k.ownerId !== c.user.id) fail(404, "Class not found.");
   const has = r.classIds.indexOf(k.id) !== -1;
@@ -594,6 +683,7 @@ function assignReview(c) {
 
 function reviewResults(c) {
   const r = ownReviewById(c.user, c.body.id);
+  const kind = kindOf(r);
   const classes = r.classIds
     .map((cid) => db.classes[cid])
     .filter(Boolean)
@@ -602,12 +692,276 @@ function reviewResults(c) {
       name: k.name,
       students: k.students.map((sid) => {
         const s = db.users[sid];
-        const sc = db.scores[r.id + ":" + sid];
-        return { name: shortName(s ? s.name : ""), best: sc ? sc.best : null, total: r.questions.length, attempts: sc ? sc.count : 0 };
+        const sc = kind === "assignment" ? db.subs[r.id + ":" + sid] : db.scores[r.id + ":" + sid];
+        return { name: shortName(s ? s.name : ""), best: sc ? (kind === "assignment" ? sc.score : sc.best) : null, total: r.questions.length, attempts: sc ? sc.count || 1 : 0 };
       })
     }));
   return { title: r.title, classes: classes };
 }
+
+function publishReview(c) {
+  requireEducator(c.user);
+  const r = ownReviewById(c.user, c.body.id);
+  if (kindOf(r) !== "review") fail(400, "Only reviews can be published.");
+  r.published = c.body.on !== false;
+  saveDb();
+  return { published: r.published };
+}
+
+function discoverList(c) {
+  requireEducator(c.user);
+  const reviews = Object.values(db.reviews)
+    .filter((r) => kindOf(r) === "review" && r.published)
+    .sort((a, b) => (b.remixes || 0) - (a.remixes || 0) || b.updated - a.updated)
+    .slice(0, 200)
+    .map((r) => Object.assign(reviewMeta(r), { author: educatorLabel(db.users[r.ownerId] || {}), mine: r.ownerId === c.user.id }));
+  return { reviews: reviews };
+}
+
+function remixReview(c) {
+  requireEducator(c.user);
+  const src = db.reviews[String(c.body.id || "")];
+  if (!src || kindOf(src) !== "review" || !src.published) fail(404, "That review isn't published.");
+  if (Object.values(db.reviews).filter((r) => r.ownerId === c.user.id).length >= 50) fail(400, "That's the most you can keep (50).");
+  const copy = { id: rand(8), ownerId: c.user.id, kind: "review", title: cleanText("Remix of " + src.title, 60), subject: src.subject, questions: JSON.parse(JSON.stringify(src.questions)), classIds: [], published: false, remixes: 0, remixOf: src.id, created: Date.now(), updated: Date.now() };
+  src.remixes = (src.remixes || 0) + 1;
+  db.reviews[copy.id] = copy;
+  saveDb();
+  return { review: reviewMeta(copy) };
+}
+
+function ownClass(c) {
+  requireEducator(c.user);
+  const k = db.classes[String(c.body.id || c.body.classId || "")];
+  if (!k || k.ownerId !== c.user.id) fail(404, "Class not found.");
+  return k;
+}
+
+function classLive(c) {
+  const k = ownClass(c);
+  const items = Object.values(db.reviews).filter((r) => r.classIds.indexOf(k.id) !== -1);
+  const now = Date.now();
+  const students = k.students
+    .map((sid) => {
+      const s = db.users[sid];
+      if (!s) return null;
+      let active = null;
+      for (const r of items) {
+        const e = live.get(r.id + ":" + sid);
+        if (!e || now - e.at > 45000) continue;
+        const list = Object.keys(e.items)
+          .map(Number)
+          .sort((a, b) => a - b)
+          .map((i) => ({ n: i + 1, q: r.questions[i] ? r.questions[i].q : "", yours: e.items[i].yours, correct: e.items[i].correct }));
+        active = { reviewId: r.id, title: r.title, kind: kindOf(r), done: list.length, total: r.questions.length, correct: list.filter((x) => x.correct).length, items: list };
+        break;
+      }
+      return { id: sid, name: shortName(s.name), active: active };
+    })
+    .filter(Boolean);
+  return { students: students };
+}
+
+function classDetail(c) {
+  const k = ownClass(c);
+  const items = Object.values(db.reviews)
+    .filter((r) => r.classIds.indexOf(k.id) !== -1)
+    .map((r) => {
+      const kind = kindOf(r);
+      let done = 0;
+      let sum = 0;
+      for (const sid of k.students) {
+        const sc = kind === "assignment" ? db.subs[r.id + ":" + sid] : db.scores[r.id + ":" + sid];
+        if (!sc) continue;
+        done++;
+        sum += (kind === "assignment" ? sc.score : sc.best) / (sc.total || r.questions.length);
+      }
+      return { id: r.id, title: r.title, kind: kind, due: r.due || null, count: r.questions.length, done: done, students: k.students.length, avg: done ? Math.round((sum / done) * 100) : null };
+    });
+  const session = [...sessions.values()].find((s) => s.classId === k.id && s.state !== "done");
+  const quizzes = Object.values(db.reviews).filter((r) => r.ownerId === c.user.id && kindOf(r) === "quiz").map(reviewMeta);
+  return {
+    class: { id: k.id, name: k.name, code: k.code },
+    students: classLive(c).students,
+    items: items,
+    quizzes: quizzes,
+    session: session ? { id: session.id, title: session.quiz.title } : null
+  };
+}
+
+function gradebook(c) {
+  const k = ownClass(c);
+  const columns = Object.values(db.reviews)
+    .filter((r) => r.classIds.indexOf(k.id) !== -1)
+    .sort((a, b) => a.created - b.created)
+    .map((r) => ({ id: r.id, title: r.title, kind: kindOf(r), due: r.due || null, total: r.questions.length }));
+  const rows = k.students.map((sid) => ({
+    id: sid,
+    name: shortName(db.users[sid] ? db.users[sid].name : ""),
+    cells: columns.reduce((o, col) => {
+      const sc = col.kind === "assignment" ? db.subs[col.id + ":" + sid] : db.scores[col.id + ":" + sid];
+      o[col.id] = sc ? { score: col.kind === "assignment" ? sc.score : sc.best, total: col.total, tries: sc.count || 1 } : null;
+      return o;
+    }, {})
+  }));
+  return { columns: columns, rows: rows };
+}
+
+function submissionDetail(c) {
+  const r = ownReviewById(c.user, c.body.reviewId);
+  const stu = db.users[String(c.body.studentId || "")];
+  if (!stu || !r.classIds.some((cid) => inClass(stu, cid))) fail(404, "Not found.");
+  const name = shortName(stu.name);
+  if (kindOf(r) === "assignment") {
+    const sub = db.subs[r.id + ":" + stu.id];
+    if (!sub) return { name: name, submitted: false };
+    return { name: name, submitted: true, score: sub.score, total: sub.total, items: sub.items.map((it, i) => ({ q: r.questions[i].q, yours: showAnswer(r.questions[i], it.yours), answer: showAnswer(r.questions[i], answerOf(r.questions[i])), correct: it.correct })) };
+  }
+  const sc = db.scores[r.id + ":" + stu.id];
+  return { name: name, submitted: !!sc, score: sc ? sc.best : null, total: r.questions.length, tries: sc ? sc.count : 0, items: [] };
+}
+
+function endQuestion(s) {
+  const q = s.quiz.questions[s.qIndex];
+  const span = q.sec * 1000;
+  for (const [uid, a] of s.answers) {
+    a.correct = isCorrect(q, a.answer);
+    a.points = a.correct ? 100 + Math.round(50 * Math.min(1, Math.max(0, s.qEnd - a.at) / span)) : 0;
+    if (a.correct) s.scores.set(uid, (s.scores.get(uid) || 0) + a.points);
+  }
+  s.state = "review";
+}
+
+function tickSession(s) {
+  s.touched = Date.now();
+  if (s.state === "question" && Date.now() >= s.qEnd) endQuestion(s);
+}
+
+function getSession(c) {
+  const s = sessions.get(String(c.body.sessionId || ""));
+  if (!s) fail(404, "That live quiz isn't running anymore.");
+  tickSession(s);
+  return s;
+}
+
+function hostSession(c) {
+  const s = getSession(c);
+  if (s.hostId !== c.user.id) fail(403, "Only the host can do that.");
+  return s;
+}
+
+function sessionBoard(s) {
+  return [...s.scores.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([uid, pts], i) => ({ rank: i + 1, id: uid, name: shortName(db.users[uid] ? db.users[uid].name : ""), points: pts }));
+}
+
+function sessionView(s, u) {
+  const host = s.hostId === u.id;
+  const out = { id: s.id, title: s.quiz.title, className: s.className, state: s.state, qIndex: s.qIndex, total: s.quiz.questions.length, joined: s.joined.size, answered: s.answers.size, now: Date.now(), host: host };
+  const q = s.quiz.questions[s.qIndex];
+  if (q && (s.state === "question" || s.state === "review")) {
+    out.question = q.t === "mc" ? { t: "mc", q: q.q, options: q.options } : { t: "short", q: q.q };
+    out.sec = q.sec;
+    out.remainingMs = Math.max(0, s.qEnd - Date.now());
+  }
+  if (q && s.state === "review") {
+    out.answer = answerOf(q);
+    out.correctCount = [...s.answers.values()].filter((a) => a.correct).length;
+    if (q.t === "mc") out.counts = q.options.map((o, i) => [...s.answers.values()].filter((a) => a.answer === i).length);
+  }
+  if (s.state === "review" || s.state === "done") out.leaderboard = sessionBoard(s);
+  if (host) {
+    out.roster = [...s.joined].map((id) => ({ name: shortName(db.users[id] ? db.users[id].name : ""), answered: s.answers.has(id) }));
+  } else {
+    const mine = s.answers.get(u.id);
+    const rank = [...s.scores.entries()].sort((a, b) => b[1] - a[1]).findIndex((e) => e[0] === u.id);
+    out.you = { joined: s.joined.has(u.id), answered: !!mine, correct: s.state === "review" && mine ? mine.correct : null, gained: s.state === "review" && mine ? mine.points : 0, points: s.scores.get(u.id) || 0, rank: rank === -1 ? null : rank + 1 };
+  }
+  return out;
+}
+
+function liveStart(c) {
+  requireEducator(c.user);
+  const r = ownReviewById(c.user, c.body.quizId);
+  if (kindOf(r) !== "quiz") fail(400, "Pick a quiz to host.");
+  const k = db.classes[String(c.body.classId || "")];
+  if (!k || k.ownerId !== c.user.id) fail(404, "Class not found.");
+  for (const x of sessions.values()) if (x.classId === k.id && x.state !== "done") fail(409, "A live quiz is already running in this class.");
+  const s = { id: rand(4), quiz: JSON.parse(JSON.stringify(r)), classId: k.id, className: k.name, hostId: c.user.id, state: "lobby", qIndex: -1, qEnd: 0, joined: new Set(), answers: new Map(), scores: new Map(), made: Date.now(), touched: Date.now() };
+  sessions.set(s.id, s);
+  return { id: s.id };
+}
+
+function liveActive(c) {
+  const u = c.user;
+  const list = [];
+  for (const s of sessions.values()) {
+    if (s.state === "done") continue;
+    const mine = u.role === "educator" ? s.hostId === u.id : u.role === "student" && inClass(u, s.classId);
+    if (mine) list.push({ id: s.id, title: s.quiz.title, className: s.className, state: s.state, host: s.hostId === u.id });
+  }
+  return { sessions: list };
+}
+
+function liveJoin(c) {
+  const s = getSession(c);
+  if (c.user.role !== "student" || !inClass(c.user, s.classId)) fail(403, "This quiz is for the class it was started in.");
+  if (s.state === "done") fail(410, "That quiz is over.");
+  s.joined.add(c.user.id);
+  return sessionView(s, c.user);
+}
+
+function liveState(c) {
+  const s = getSession(c);
+  const ok = s.hostId === c.user.id || (c.user.role === "student" && inClass(c.user, s.classId));
+  if (!ok) fail(403, "This quiz is for the class it was started in.");
+  return sessionView(s, c.user);
+}
+
+function liveNext(c) {
+  const s = hostSession(c);
+  if (s.state === "question") fail(409, "Finish this question first, or press Skip Timer.");
+  if (s.qIndex + 1 >= s.quiz.questions.length) {
+    s.state = "done";
+    return sessionView(s, c.user);
+  }
+  s.qIndex++;
+  s.answers = new Map();
+  s.state = "question";
+  s.qEnd = Date.now() + s.quiz.questions[s.qIndex].sec * 1000;
+  return sessionView(s, c.user);
+}
+
+function liveSkip(c) {
+  const s = hostSession(c);
+  if (s.state === "question") endQuestion(s);
+  return sessionView(s, c.user);
+}
+
+function liveAnswer(c) {
+  const s = getSession(c);
+  if (!s.joined.has(c.user.id)) fail(403, "Join the quiz first.");
+  if (s.state !== "question" || Number(c.body.qIndex) !== s.qIndex) fail(409, "That question is over.");
+  if (s.answers.has(c.user.id)) fail(409, "You already answered.");
+  const q = s.quiz.questions[s.qIndex];
+  s.answers.set(c.user.id, { answer: cleanAnswer(q, c.body.answer), at: Date.now() });
+  if (s.answers.size >= s.joined.size) endQuestion(s);
+  return sessionView(s, c.user);
+}
+
+function liveEnd(c) {
+  const s = hostSession(c);
+  s.state = "done";
+  return sessionView(s, c.user);
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, e] of live) if (now - e.at > 600000) live.delete(k);
+  for (const [k, s] of sessions) if (now - s.touched > (s.state === "done" ? 900000 : 10800000)) sessions.delete(k);
+}, 60000).unref();
 
 function listClasses(c) {
   const u = c.user;
@@ -711,6 +1065,23 @@ const ROUTES = {
   "POST /reviews/update": { auth: true, max: 60000, fn: updateReview },
   "POST /reviews/delete": { auth: true, fn: deleteReview },
   "POST /reviews/take": { auth: true, fn: takeReview },
+  "POST /reviews/check": { auth: true, fn: checkReview },
+  "POST /reviews/progress": { auth: true, fn: progressReview },
+  "POST /reviews/publish": { auth: true, fn: publishReview },
+  "POST /reviews/submission": { auth: true, fn: submissionDetail },
+  "GET /discover": { auth: true, fn: discoverList },
+  "POST /discover/remix": { auth: true, fn: remixReview },
+  "POST /classes/detail": { auth: true, fn: classDetail },
+  "POST /classes/live": { auth: true, fn: classLive },
+  "POST /classes/gradebook": { auth: true, fn: gradebook },
+  "POST /live/start": { auth: true, fn: liveStart },
+  "GET /live/active": { auth: true, fn: liveActive },
+  "POST /live/join": { auth: true, fn: liveJoin },
+  "POST /live/state": { auth: true, fn: liveState },
+  "POST /live/next": { auth: true, fn: liveNext },
+  "POST /live/skip": { auth: true, fn: liveSkip },
+  "POST /live/answer": { auth: true, fn: liveAnswer },
+  "POST /live/end": { auth: true, fn: liveEnd },
   "POST /reviews/submit": { auth: true, fn: submitReview },
   "POST /reviews/assign": { auth: true, fn: assignReview },
   "POST /reviews/results": { auth: true, fn: reviewResults },
@@ -798,7 +1169,7 @@ const server = http.createServer(async (req, res) => {
     if (route.limit && limited("auth:" + ip, route.limit, 600000)) fail(429, "Too many sign-in tries. Please wait a few minutes.");
     const user = route.auth ? userFromRequest(req) : null;
     if (route.auth && !user) fail(401, "Please sign in again.");
-    if (route.auth && limited("api:" + user.id, 240, 60000)) fail(429, "Slow down a little.");
+    if (route.auth && limited("api:" + user.id, 600, 60000)) fail(429, "Slow down a little.");
     const body = await readJson(req, route.max || 10000);
     const out = await route.fn({ req: req, ip: ip, body: body, user: user });
     reply(200, out);
